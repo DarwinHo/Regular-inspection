@@ -4,6 +4,7 @@
 
 import os
 import asyncio
+import random
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Tuple
 from playwright.async_api import Page, BrowserContext
@@ -12,14 +13,82 @@ import re
 from utils.config import AuthConfig, ProviderConfig
 from utils.logger import setup_logger
 from utils.sanitizer import sanitize_exception
+from utils.ci_config import CIConfig
 from utils.constants import (
     DEFAULT_USER_AGENT,
     KEY_COOKIE_NAMES,
     TimeoutConfig,
 )
+from utils.human_behavior import (
+    simulate_human_behavior,
+    simulate_page_interaction,
+    simulate_typing,
+    simulate_click_with_behavior,
+)
 
 # 模块级logger
 logger = setup_logger(__name__)
+
+
+class CloudscraperHelper:
+    """cloudscraper 辅助类 - 用于获取绕过 Cloudflare 的初始 cookies（降级方案）"""
+
+    @staticmethod
+    async def get_cf_cookies(url: str, proxy: Optional[str] = None) -> Dict[str, str]:
+        """
+        使用 cloudscraper 获取绕过 Cloudflare 的 cookies
+
+        Args:
+            url: 目标网站 URL
+            proxy: 代理地址（可选），格式：http://host:port
+
+        Returns:
+            Dict[str, str]: cookies 字典
+        """
+        def _sync_get_cookies():
+            """同步获取 cookies（在线程池中运行）"""
+            try:
+                import cloudscraper
+
+                # 创建 scraper 实例
+                scraper = cloudscraper.create_scraper(
+                    browser={
+                        'browser': 'chrome',
+                        'platform': 'windows',
+                        'desktop': True
+                    }
+                )
+
+                # 配置代理
+                proxies = None
+                if proxy:
+                    proxies = {
+                        'http': proxy,
+                        'https': proxy
+                    }
+
+                # 访问目标网站
+                response = scraper.get(url, proxies=proxies, timeout=30)
+
+                # 提取 cookies
+                cookies = {cookie.name: cookie.value for cookie in scraper.cookies}
+                return cookies
+
+            except ImportError:
+                logger.debug("⚠️ cloudscraper 未安装，跳过此降级方案")
+                return {}
+            except Exception as e:
+                logger.debug(f"⚠️ Cloudscraper 获取失败: {e}")
+                return {}
+
+        # 在线程池中运行同步代码
+        try:
+            loop = asyncio.get_event_loop()
+            cookies = await loop.run_in_executor(None, _sync_get_cookies)
+            return cookies
+        except Exception as e:
+            logger.debug(f"⚠️ Cloudscraper 执行异常: {e}")
+            return {}
 
 
 class Authenticator(ABC):
@@ -29,6 +98,8 @@ class Authenticator(ABC):
         self.account_name = account_name
         self.auth_config = auth_config
         self.provider_config = provider_config
+        self.is_ci = CIConfig.is_ci_environment()
+        self.enable_behavior_simulation = CIConfig.should_enable_behavior_simulation()
 
     @abstractmethod
     async def authenticate(self, page: Page, context: BrowserContext) -> Dict[str, Any]:
@@ -99,6 +170,14 @@ class Authenticator(ABC):
                             logger.warning(f"⚠️ 重新访问失败: {e}")
                 else:
                     logger.info(f"🛡️ 检测到可能的Cloudflare验证，等待完成（最多{int(current_wait_time)}秒）...")
+
+                # CI 环境下，在开始等待前添加行为模拟
+                if self.enable_behavior_simulation and retry == 0:
+                    try:
+                        logger.info(f"🤖 CI 环境：开始模拟人类行为以提高验证通过率...")
+                        await simulate_page_interaction(page, logger)
+                    except Exception as sim_error:
+                        logger.debug(f"⚠️ 行为模拟异常（非致命）: {sim_error}")
 
                 # 开始等待验证通过
                 start_time = asyncio.get_event_loop().time()
@@ -286,11 +365,92 @@ class Authenticator(ABC):
 
         return None, None
 
+    async def _get_waf_cookies(self, page: Page, context: BrowserContext, use_cloudscraper: bool = True) -> Dict[str, str]:
+        """
+        获取 WAF cookies - 支持 Playwright + cloudscraper 双重降级
+
+        优先使用 Playwright（更可靠），失败时降级到 cloudscraper
+
+        Args:
+            page: Playwright 页面对象
+            context: 浏览器上下文
+            use_cloudscraper: 是否启用 cloudscraper 降级（默认启用）
+
+        Returns:
+            Dict[str, str]: cookies 字典
+        """
+        # 方案 A：优先使用 Playwright（当前方案）
+        try:
+            logger.info("ℹ️ 尝试使用 Playwright 获取 WAF cookies...")
+
+            await page.goto(
+                self.provider_config.get_login_url(),
+                wait_until="domcontentloaded",
+                timeout=TimeoutConfig.PAGE_LOAD
+            )
+            await page.wait_for_timeout(TimeoutConfig.SHORT_WAIT_3)
+
+            cookies = await context.cookies()
+            waf_cookies = {cookie["name"]: cookie["value"] for cookie in cookies}
+
+            if waf_cookies:
+                logger.info(f"✅ Playwright 获取成功: {len(waf_cookies)} 个 cookies")
+                return waf_cookies
+
+        except Exception as e:
+            logger.warning(f"⚠️ Playwright 获取 WAF cookies 失败: {e}")
+
+        # 方案 B：降级到 cloudscraper（仅在启用且 Playwright 失败时）
+        if use_cloudscraper:
+            logger.info("ℹ️ 降级使用 cloudscraper...")
+
+            try:
+                # 从环境变量获取代理配置（可选）
+                proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+
+                cf_cookies = await CloudscraperHelper.get_cf_cookies(
+                    self.provider_config.get_login_url(),
+                    proxy
+                )
+
+                if cf_cookies:
+                    logger.info(f"✅ Cloudscraper 获取成功: {len(cf_cookies)} 个 cookies")
+
+                    # 将 cloudscraper 获取的 cookies 注入到 Playwright context
+                    domain = self._get_domain(self.provider_config.get_login_url())
+                    for name, value in cf_cookies.items():
+                        try:
+                            await context.add_cookies([{
+                                "name": name,
+                                "value": value,
+                                "domain": domain,
+                                "path": "/"
+                            }])
+                        except Exception as cookie_error:
+                            logger.debug(f"⚠️ 注入 cookie {name} 失败: {cookie_error}")
+
+                    return cf_cookies
+
+            except Exception as e:
+                logger.warning(f"⚠️ Cloudscraper 也失败: {e}")
+
+        # 方案 C：如果都失败，返回空字典（不阻塞后续流程）
+        logger.warning("⚠️ 所有 WAF cookies 获取方案均失败，使用空 cookies 继续")
+        return {}
+
     async def _init_page_and_check_cloudflare(self, page: Page) -> bool:
         """初始化页面并检查Cloudflare"""
         try:
             await page.goto(self.provider_config.get_login_url(), wait_until="domcontentloaded", timeout=TimeoutConfig.PAGE_LOAD)
             await page.wait_for_timeout(TimeoutConfig.SHORT_WAIT_3)
+
+            # CI 环境下，页面加载后添加行为模拟
+            if self.enable_behavior_simulation:
+                try:
+                    logger.info(f"🤖 CI 环境：页面加载后模拟人类浏览行为...")
+                    await simulate_human_behavior(page, logger)
+                except Exception as sim_error:
+                    logger.debug(f"⚠️ 页面加载后行为模拟异常（非致命）: {sim_error}")
 
             page_title = await page.title()
             page_content = await page.content()
@@ -330,12 +490,96 @@ class Authenticator(ABC):
         """安全填写密码 - 模拟人类逐字符输入"""
         try:
             import random
-            # 模拟人类逐字符输入，增加随机延迟
-            for char in self.auth_config.password:
-                await password_input.type(char, delay=50 + random.randint(0, 50))
+            # CI 环境下使用更自然的打字延迟
+            if self.enable_behavior_simulation:
+                # 模拟人类逐字符输入，增加更大的随机延迟
+                for char in self.auth_config.password:
+                    await password_input.type(char, delay=80 + random.randint(0, 80))
+            else:
+                # 非 CI 环境使用原有逻辑
+                for char in self.auth_config.password:
+                    await password_input.type(char, delay=50 + random.randint(0, 50))
             return None
         except Exception as e:
             return f"{error_prefix}: {sanitize_exception(e)}"
+
+    async def _simulate_human_click(self, page: Page, selector: str) -> bool:
+        """模拟人类点击行为（CI 环境优化版）
+
+        在 CI 环境下，使用行为模拟来点击元素；在非 CI 环境下，使用普通点击。
+
+        Args:
+            page: Playwright 页面对象
+            selector: 要点击的元素选择器
+
+        Returns:
+            bool: 是否成功点击
+        """
+        try:
+            if self.enable_behavior_simulation:
+                logger.debug(f"🤖 使用行为模拟点击: {selector}")
+                return await simulate_click_with_behavior(page, selector, logger, with_movement=True)
+            else:
+                await page.click(selector)
+                logger.debug(f"✅ 点击元素: {selector}")
+                return True
+        except Exception as e:
+            logger.warning(f"⚠️ 点击失败 {selector}: {e}")
+            return False
+
+    async def _simulate_human_typing(self, page: Page, selector: str, text: str) -> bool:
+        """模拟人类打字行为（CI 环境优化版）
+
+        在 CI 环境下，使用逐字符打字模拟；在非 CI 环境下，使用普通填充。
+
+        Args:
+            page: Playwright 页面对象
+            selector: 输入框选择器
+            text: 要输入的文本
+
+        Returns:
+            bool: 是否成功输入
+        """
+        try:
+            if self.enable_behavior_simulation:
+                logger.debug(f"🤖 使用行为模拟打字: {selector}")
+                return await simulate_typing(page, selector, text, logger)
+            else:
+                await page.fill(selector, text)
+                logger.debug(f"✅ 填充文本: {selector}")
+                return True
+        except Exception as e:
+            logger.warning(f"⚠️ 输入失败 {selector}: {e}")
+            return False
+
+    async def _goto_with_behavior(self, page: Page, url: str, **kwargs) -> None:
+        """访问页面并模拟人类行为（CI 环境优化版）
+
+        在 CI 环境下，访问页面后会自动模拟人类浏览行为。
+
+        Args:
+            page: Playwright 页面对象
+            url: 要访问的 URL
+            **kwargs: 传递给 page.goto 的其他参数
+        """
+        try:
+            await page.goto(url, **kwargs)
+            logger.debug(f"✅ 访问页面: {url}")
+
+            # 等待页面稳定
+            await asyncio.sleep(random.uniform(1, 2))
+
+            # CI 环境下模拟行为
+            if self.enable_behavior_simulation:
+                try:
+                    logger.info(f"🤖 CI 环境：访问页面后模拟人类行为...")
+                    await simulate_human_behavior(page, logger)
+                except Exception as sim_error:
+                    logger.debug(f"⚠️ 页面访问后行为模拟异常（非致命）: {sim_error}")
+
+        except Exception as e:
+            logger.error(f"❌ 访问页面失败 {url}: {e}")
+            raise
 
     async def _retry_with_strategies(
         self,

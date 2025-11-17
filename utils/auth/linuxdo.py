@@ -210,12 +210,22 @@ class LinuxDoAuthenticator(Authenticator):
             wait_time = 15000 if is_ci else 10000
             logger.info(f"⏳ [{self.auth_config.username}] 等待Cloudflare验证完全通过（{wait_time/1000}秒）...")
             await page.wait_for_timeout(wait_time)
-            
+
             # 第二步：获取通过 Cloudflare 验证后的 cookies
+            # 如果 Playwright 获取失败，尝试使用 cloudscraper 降级
             logger.info(f"🔑 [{self.auth_config.username}] 获取初始cookies...")
             initial_cookies = await context.cookies()
             cookies_dict = {cookie["name"]: cookie["value"] for cookie in initial_cookies}
-            logger.info(f"🍪 [{self.auth_config.username}] 获取到 {len(cookies_dict)} 个cookies用于API请求")
+
+            # 如果 cookies 数量太少，尝试使用 cloudscraper 增强
+            if len(cookies_dict) < 2:
+                logger.warning(f"⚠️ [{self.auth_config.username}] Playwright 获取的 cookies 较少({len(cookies_dict)}个)，尝试 cloudscraper 增强...")
+                enhanced_cookies = await self._get_waf_cookies(page, context, use_cloudscraper=True)
+                if enhanced_cookies and len(enhanced_cookies) > len(cookies_dict):
+                    cookies_dict = enhanced_cookies
+                    logger.info(f"✅ [{self.auth_config.username}] Cloudscraper 增强成功，现有 {len(cookies_dict)} 个cookies")
+            else:
+                logger.info(f"🍪 [{self.auth_config.username}] 获取到 {len(cookies_dict)} 个cookies用于API请求")
 
             # 第三步：获取 OAuth client_id（带重试）
             max_retries = 3
@@ -265,6 +275,16 @@ class LinuxDoAuthenticator(Authenticator):
                     logger.warning(f"⚠️ [{self.auth_config.username}] 第 {retry + 1} 次尝试失败，继续重试...")
                 else:
                     logger.error(f"❌ [{self.auth_config.username}] 所有重试均失败")
+                    # 最后尝试：使用 cloudscraper 增强 cookies 后再试一次
+                    logger.info(f"🔄 [{self.auth_config.username}] 最后尝试：使用 cloudscraper 增强...")
+                    enhanced_cookies = await self._get_waf_cookies(page, context, use_cloudscraper=True)
+                    if enhanced_cookies:
+                        cookies_dict.update(enhanced_cookies)
+                        client_id_result = await self._get_auth_client_id(cookies_dict, page)
+                        if client_id_result:
+                            logger.info(f"✅ [{self.auth_config.username}] Cloudscraper 增强后 client_id获取成功")
+                            break
+                    logger.error(f"❌ [{self.auth_config.username}] Cloudscraper 增强后仍然失败")
                 
             if not client_id_result:
                 # 在 CI 环境中提供更详细的错误信息
@@ -298,16 +318,115 @@ class LinuxDoAuthenticator(Authenticator):
             await page.goto(oauth_url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(2000)
 
-            # 第五步：检查是否需要登录
+            # 第五步：检查页面状态
             current_url = page.url
             logger.info(f"🔍 [{self.auth_config.username}] 当前URL: {current_url}")
 
+            # 检查是否需要登录
             if "linux.do" in current_url and "/login" in current_url:
                 # 需要登录
                 logger.info(f"🔐 [{self.auth_config.username}] 需要登录到 Linux.do...")
 
-                username_input = await page.query_selector('input[id="login-account-name"]')
-                password_input = await page.query_selector('input[id="login-account-password"]')
+                # 等待 Cloudflare 验证完成
+                logger.info(f"⏳ [{self.auth_config.username}] 等待 Cloudflare 验证完成...")
+                await page.wait_for_timeout(5000)
+
+                # 多次尝试查找登录表单元素（使用多种选择器）
+                username_input = None
+                password_input = None
+
+                # 定义多种可能的选择器
+                username_selectors = [
+                    'input[id="login-account-name"]',
+                    'input[name="login"]',
+                    'input[type="text"]',
+                    'input.username',
+                    '#login-account-name'
+                ]
+
+                password_selectors = [
+                    'input[id="login-account-password"]',
+                    'input[name="password"]',
+                    'input[type="password"]',
+                    'input.password',
+                    '#login-account-password'
+                ]
+
+                # 尝试最多3次查找登录表单
+                for attempt in range(3):
+                    logger.info(f"🔍 [{self.auth_config.username}] 登录表单查找尝试 {attempt + 1}/3...")
+
+                    # 尝试查找用户名输入框
+                    for selector in username_selectors:
+                        try:
+                            username_input = await page.wait_for_selector(selector, timeout=3000)
+                            if username_input:
+                                logger.info(f"✅ [{self.auth_config.username}] 找到用户名输入框: {selector}")
+                                break
+                        except:
+                            continue
+
+                    # 尝试查找密码输入框
+                    for selector in password_selectors:
+                        try:
+                            password_input = await page.wait_for_selector(selector, timeout=3000)
+                            if password_input:
+                                logger.info(f"✅ [{self.auth_config.username}] 找到密码输入框: {selector}")
+                                break
+                        except:
+                            continue
+
+                    # 如果找到了用户名和密码输入框，跳出循环
+                    if username_input and password_input:
+                        logger.info(f"✅ [{self.auth_config.username}] 成功找到完整登录表单")
+                        break
+
+                    # 未找到表单，检查页面状态
+                    if attempt < 2:
+                        logger.warning(f"⚠️ [{self.auth_config.username}] 未找到登录表单，等待后重试...")
+                        await page.wait_for_timeout(3000)
+
+                        # 检查是否有 Cloudflare 验证
+                        page_content = await page.content()
+                        if 'challenge-platform' in page_content or 'cf-challenge' in page_content or 'ray id' in page_content.lower():
+                            logger.warning(f"⚠️ [{self.auth_config.username}] 检测到 Cloudflare 验证页面，额外等待5秒...")
+                            await page.wait_for_timeout(5000)
+
+                # 最终检查是否找到表单
+                if not username_input or not password_input:
+                    # 记录详细调试信息
+                    page_content = await page.content()
+                    page_title = await page.title()
+
+                    logger.error(f"❌ [{self.auth_config.username}] 未找到登录表单")
+                    logger.error(f"   页面标题: {page_title}")
+                    logger.error(f"   页面URL: {current_url}")
+                    logger.error(f"   页面内容长度: {len(page_content)}")
+
+                    # 检查是否被 Cloudflare 拦截
+                    if 'challenge-platform' in page_content or 'cf-challenge' in page_content:
+                        logger.error(f"❌ [{self.auth_config.username}] 被 Cloudflare 拦截")
+                        return {"success": False, "error": "Blocked by Cloudflare verification"}
+
+                    # 检查是否有其他验证
+                    if 'ray id' in page_content.lower() or 'cloudflare' in page_content.lower():
+                        logger.error(f"❌ [{self.auth_config.username}] 可能被 Cloudflare 拦截（Ray ID 存在）")
+
+                    # 保存页面截图和内容用于调试（如果不在CI环境）
+                    try:
+                        if not CIConfig.is_ci_environment():
+                            screenshot_path = f"debug_login_form_{self.auth_config.username}.png"
+                            await page.screenshot(path=screenshot_path)
+                            logger.info(f"   已保存截图: {screenshot_path}")
+
+                            html_path = f"debug_login_form_{self.auth_config.username}.html"
+                            with open(html_path, 'w', encoding='utf-8') as f:
+                                f.write(page_content)
+                            logger.info(f"   已保存HTML: {html_path}")
+                    except Exception as debug_error:
+                        logger.warning(f"   无法保存调试文件: {debug_error}")
+
+                    return {"success": False, "error": "Login form not found after 3 attempts"}
 
                 if username_input and password_input:
                     # 添加人性化延迟
@@ -449,9 +568,6 @@ class LinuxDoAuthenticator(Authenticator):
                                             logger.warning(f"⚠️ [{self.auth_config.username}] 继续尝试查找授权按钮...")
                                 except:
                                     pass
-                else:
-                    logger.error(f"❌ [{self.auth_config.username}] 未找到登录表单")
-                    return {"success": False, "error": "Login form not found"}
 
             # 第六步：等待授权按钮并点击
             try:
@@ -493,8 +609,10 @@ class LinuxDoAuthenticator(Authenticator):
                         
                         return {"success": False, "error": "Still on login page - credentials may be invalid or CAPTCHA required"}
                 else:
-                    # 不在登录页面，正常等待授权按钮（增加到45秒）
-                    await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=45000)
+                    # 不在登录页面，正常等待授权按钮（增加到90秒，CI环境使用倍增器）
+                    is_ci = CIConfig.is_ci_environment()
+                    timeout = 180000 if is_ci else 90000  # CI环境180秒，本地90秒
+                    await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=timeout)
 
                 allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
                 if allow_btn:
@@ -505,20 +623,34 @@ class LinuxDoAuthenticator(Authenticator):
 
             except Exception as e:
                 logger.error(f"❌ [{self.auth_config.username}] 等待授权按钮超时: {e}")
-                logger.info(f"   当前URL: {page.url}")
-                
-                # 获取更多调试信息
-                try:
-                    page_title = await page.title()
-                    logger.info(f"   页面标题: {page_title}")
-                    
-                    # 检查页面上是否有其他可用元素
-                    buttons = await page.query_selector_all('button, a.btn')
-                    logger.info(f"   页面上找到 {len(buttons)} 个按钮元素")
-                except Exception as debug_error:
-                    logger.warning(f"   无法获取调试信息: {debug_error}")
-                
-                return {"success": False, "error": f"Authorization button timeout: {sanitize_exception(e)}"}
+
+                # 检查是否已经跳转到回调页面（可能授权已完成）
+                current_url = page.url
+                logger.info(f"   当前URL: {current_url}")
+
+                # 检查URL是否包含OAuth回调或已跳转到目标域名
+                provider_domain = self.provider_config.base_url.replace('https://', '').replace('http://', '')
+                if 'oauth/callback' in current_url or '/oauth/' in current_url or provider_domain in current_url:
+                    logger.info(f"✅ [{self.auth_config.username}] 检测到已跳转到回调页面，授权可能已完成")
+                    # 继续执行后续流程（等待OAuth回调）
+                else:
+                    # 获取更多调试信息
+                    try:
+                        page_title = await page.title()
+                        logger.info(f"   页面标题: {page_title}")
+
+                        # 检查是否需要登录
+                        if 'linux.do/login' in current_url:
+                            logger.error(f"❌ [{self.auth_config.username}] 页面跳转到登录页，可能会话已过期")
+                            return {"success": False, "error": "Session expired - redirected to login page"}
+
+                        # 检查页面上是否有其他可用元素
+                        buttons = await page.query_selector_all('button, a.btn')
+                        logger.info(f"   页面上找到 {len(buttons)} 个按钮元素")
+                    except Exception as debug_error:
+                        logger.warning(f"   无法获取调试信息: {debug_error}")
+
+                    return {"success": False, "error": f"Authorization button timeout: {sanitize_exception(e)}"}
 
             # 第七步：等待OAuth回调
             logger.info(f"⏳ [{self.auth_config.username}] 等待OAuth回调...")
