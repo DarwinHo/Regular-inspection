@@ -173,6 +173,13 @@ class CheckIn:
                 return False, {"error": f"{auth_config.method.value} skipped in CI (CI_DISABLED_AUTH_METHODS)"}
             else:
                 self.logger.warning(f"⚠️ [{self.account.name}] CI环境中的 {auth_config.method.value} 认证可能失败（需要人机验证）")
+
+        # 对于单纯的 Cookies 认证，先尝试纯 HTTP 流程，必要时再回退到浏览器
+        if auth_config.method == AuthMethod.COOKIES:
+            http_success, user_info, needs_browser = await self._checkin_with_cookies_http(auth_config)
+            if not needs_browser:
+                return http_success, user_info
+            self.logger.info(f"ℹ️ [{self.account.name}] Cookies 认证需要浏览器配合，回退至 Playwright 流程")
         
         # 为每次认证创建独立的临时目录和浏览器上下文
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -362,9 +369,67 @@ class CheckIn:
                     if temp_dir and os.path.exists(temp_dir):
                         import shutil
                         shutil.rmtree(temp_dir, ignore_errors=True)
-                        self.logger.debug(f"🗑️ [{self.account.name}] 临时目录已清理: {temp_dir}")
+                    self.logger.debug(f"🗑️ [{self.account.name}] 临时目录已清理: {temp_dir}")
                 except Exception as e:
                     self.logger.debug(f"⚠️ [{self.account.name}] 清理临时目录失败: {e}")
+
+    async def _checkin_with_cookies_http(self, auth_config: AuthConfig) -> Tuple[bool, Optional[Dict[str, Any]], bool]:
+        """仅使用Cookies和HTTP请求执行签到（无Playwright环境下的后备方案）
+
+        Returns:
+            Tuple[success, user_info, needs_browser_fallback]
+        """
+        cookies = auth_config.cookies or {}
+        if not cookies:
+            self.logger.error(f"❌ [{self.account.name}] 未提供任何Cookies")
+            return False, {"error": "No cookies configured for this account"}, False
+
+        self.logger.info(f"🌐 [{self.account.name}] 使用HTTP模式执行 Cookies 签到（跳过浏览器）")
+        self._check_key_cookies(cookies)
+
+        try:
+            provider_name = self.provider.name.lower()
+
+            if provider_name == "agentrouter":
+                user_info = await self._get_user_info(cookies, auth_config)
+                if user_info and user_info.get("success"):
+                    balance_change = self._calculate_balance_change(
+                        self.account.name,
+                        auth_config.method.value,
+                        user_info,
+                    )
+                    user_info["balance_change"] = balance_change
+                    self._save_balance_data(self.account.name, auth_config.method.value, user_info)
+                    return True, user_info, False
+
+                return False, {"error": "Failed to fetch user info with provided cookies"}, False
+
+            # AnyRouter 等平台：先执行签到，再读取用户信息
+            checkin_result = await self._do_checkin(cookies, auth_config)
+            if not checkin_result.get("success"):
+                return False, {"error": checkin_result.get("message", "Check-in failed")}, False
+
+            if checkin_result.get("needs_validation"):
+                self.logger.info(f"⚠️ [{self.account.name}] 签到返回 HTML/JS 挑战，准备回退到浏览器处理")
+                return False, {"error": "HTML challenge detected, needs browser validation"}, True
+
+            user_info = await self._get_user_info(cookies, auth_config)
+            if user_info and user_info.get("success"):
+                balance_change = self._calculate_balance_change(
+                    self.account.name,
+                    auth_config.method.value,
+                    user_info,
+                )
+                user_info["balance_change"] = balance_change
+                self._save_balance_data(self.account.name, auth_config.method.value, user_info)
+                return True, user_info, False
+
+            # 签到成功但未能读取信息
+            return True, {"success": True, "message": "Check-in successful but failed to get user info"}, False
+
+        except Exception as e:
+            self.logger.error(f"❌ [{self.account.name}] Cookies HTTP 签到异常: {str(e)}")
+            return False, {"error": f"Cookie authentication failed: {str(e)}"}, False
 
     async def _get_waf_cookies(self, page: Page, context: BrowserContext) -> Dict[str, str]:
         """获取 WAF cookies"""
@@ -473,8 +538,14 @@ class CheckIn:
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             self.logger.error(f"❌ [{self.account.name}] 解析签到响应失败: {e}")
             self.logger.info(f"📄 [{self.account.name}] 原始响应: {response.text[:200]}...")
-            if "html" in response.headers.get("content-type", "").lower():
-                self.logger.info(f"🔄 [{self.account.name}] 检测到HTML响应，可能需要重新登录")
+            content_type = response.headers.get("content-type", "").lower()
+            if "html" in content_type or "<html" in response.text[:200].lower():
+                self.logger.info(f"🔄 [{self.account.name}] 检测到HTML/JavaScript响应，尝试通过用户信息验证签到结果")
+                return {
+                    "success": True,
+                    "message": "收到HTML响应，已记录Set-Cookie并将通过用户信息验证",
+                    "needs_validation": True,
+                }
             return {"success": False, "message": "响应解析失败"}
 
     async def _handle_401_response(self, client: httpx.AsyncClient) -> Dict[str, Any]:

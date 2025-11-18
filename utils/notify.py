@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 
 class NotificationKit:
     def __init__(self) -> None:
+        self._load_config()
+
+    def _load_config(self) -> None:
         self.email_user: str = os.getenv('EMAIL_USER', '')
         self.email_pass: str = os.getenv('EMAIL_PASS', '')
         self.email_to: str = os.getenv('EMAIL_TO', '')
@@ -182,6 +185,9 @@ class NotificationKit:
 
     def push_message(self, title: str, content: str, msg_type: Literal['text', 'html'] = 'text') -> None:
         """发送通知消息（仅尝试已配置的渠道）"""
+        # 每次发送前刷新配置，确保 load_dotenv 后的变量能够被读取
+        self._load_config()
+
         # 定义所有可用的通知渠道（名称、检查配置、发送函数）
         all_notifications = [
             ('Email', lambda: bool(self.email_user and self.email_pass and self.email_to),

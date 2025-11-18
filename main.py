@@ -86,13 +86,15 @@ def validate_env_vars():
 
     # 检查可选但建议的环境变量
     optional_vars = {
-        "NOTIFY_PUSHPLUS_TOKEN": "PushPlus 推送通知",
-        "NOTIFY_DINGTALK_WEBHOOK": "钉钉webhook通知",
-        "NOTIFY_FEISHU_WEBHOOK": "飞书webhook通知",
-        "NOTIFY_WECHAT_WORK_WEBHOOK": "企业微信webhook通知",
+        "SERVERPUSHKEY": "Server酱通知",
+        "PUSHPLUS_TOKEN": "PushPlus 推送通知",
+        "DINGDING_WEBHOOK": "钉钉webhook通知",
+        "FEISHU_WEBHOOK": "飞书webhook通知",
+        "WEIXIN_WEBHOOK": "企业微信webhook通知",
     }
 
-    has_notify = any(os.getenv(var) for var in optional_vars.keys())
+    email_configured = all(os.getenv(var) for var in ["EMAIL_USER", "EMAIL_PASS", "EMAIL_TO"])
+    has_notify = email_configured or any(os.getenv(var) for var in optional_vars.keys())
     if not has_notify:
         warnings.append("未配置任何通知方式，将无法接收签到结果通知")
 
